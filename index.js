@@ -16,6 +16,12 @@ import { getBrowserManager } from './lib/browser.js';
 
 config();
 
+// Last-resort safety net: a stray async error (e.g. a missing system binary
+// firing a late 'error' event) must NEVER crash-loop the Space. Log and keep
+// serving — the proxy's pure-Node path doesn't depend on the browser.
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e?.message || e));
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e?.message || e));
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
@@ -63,15 +69,17 @@ async function startBrowserForActive() {
     if (!acc?.cookie) return;
     const proxyUrl = `http://127.0.0.1:${PORT}`;
     try {
-        await browser.start({
+        const st = await browser.start({
             cookieString: acc.cookie,
             userAgent: acc.user_agent,
             proxyUrl,
             refreshToken: REFRESH_TOKEN,
         });
-        console.log('[Boot] In-Space signer browser launched.');
+        if (st.lastError) console.error('[Browser] launch failed:', st.lastError);
+        else console.log('[Browser] In-Space signer browser launched.');
+        return st;
     } catch (e) {
-        console.error('[Boot] Browser launch failed (falling back to userscript relay):', e.message);
+        console.error('[Browser] launch threw (falling back to userscript relay):', e.message);
     }
 }
 
@@ -156,9 +164,15 @@ app.post('/admin/accounts', adminAuth, (req, res) => {
         id = r.lastInsertRowid;
     }
 
+    // Single-active invariant: the newly added/updated account becomes THE active
+    // one; every other account is deactivated. Without this, multiple rows stay
+    // active=1 and loadActiveAccount() can pick a stale one on the next restart.
+    db.prepare('UPDATE accounts SET active = 0 WHERE id != ?').run(id);
+
     activeAccountId = id;
     grok.loadAccount({ cookie: parsed.cookie, userAgent: parsed.userAgent, statsigId: parsed.statsigId });
-    startBrowserForActive().catch(() => {});
+    // NOTE: the in-Space browser is NOT auto-launched. Start it explicitly from
+    // the admin panel ("Launch browser") once an account is loaded.
     res.json({
         message: parsed.statsigId
             ? 'Account saved + initial sig seeded (good ~3-4 min). Install the refresher to keep it fed.'
@@ -168,14 +182,47 @@ app.post('/admin/accounts', adminAuth, (req, res) => {
 });
 
 app.delete('/admin/accounts/:id', adminAuth, (req, res) => {
-    getDB().prepare('DELETE FROM accounts WHERE id = ?').run(req.params.id);
-    res.json({ message: 'Deleted' });
+    const delId = parseInt(req.params.id, 10);
+    getDB().prepare('DELETE FROM accounts WHERE id = ?').run(delId);
+
+    // If we just deleted the account that's loaded in memory, drop it and stop
+    // serving its cookie — otherwise the proxy keeps using a deleted account.
+    if (activeAccountId === delId) {
+        activeAccountId = null;
+        grok.loadAccount(null);
+        if (ENABLE_BROWSER) browser.stop().catch(() => {});
+        // Promote any surviving account (most recent) and make it active.
+        const next = getDB().prepare('SELECT * FROM accounts ORDER BY last_used DESC, id DESC').get();
+        if (next) {
+            getDB().prepare('UPDATE accounts SET active = 1 WHERE id = ?').run(next.id);
+            activeAccountId = next.id;
+            grok.loadAccount({ cookie: next.cookie, userAgent: next.user_agent });
+            // Browser is button-only — do not auto-launch on promotion.
+        }
+    }
+    res.json({ message: 'Deleted', activeAccountId });
 });
 
 app.patch('/admin/accounts/:id', adminAuth, (req, res) => {
-    if (req.body.active !== undefined)
-        getDB().prepare('UPDATE accounts SET active = ? WHERE id = ?').run(req.body.active ? 1 : 0, req.params.id);
-    res.json({ message: 'Updated' });
+    const tgt = parseInt(req.params.id, 10);
+    if (req.body.active !== undefined) {
+        const db = getDB();
+        if (req.body.active) {
+            // Activating one account deactivates the rest (single-active invariant)
+            // and makes it the live one in memory. Browser is button-only.
+            db.prepare('UPDATE accounts SET active = 0').run();
+            db.prepare('UPDATE accounts SET active = 1 WHERE id = ?').run(tgt);
+            const acc = db.prepare('SELECT * FROM accounts WHERE id = ?').get(tgt);
+            if (acc) {
+                activeAccountId = acc.id;
+                grok.loadAccount({ cookie: acc.cookie, userAgent: acc.user_agent });
+            }
+        } else {
+            db.prepare('UPDATE accounts SET active = 0 WHERE id = ?').run(tgt);
+            if (activeAccountId === tgt) { activeAccountId = null; grok.loadAccount(null); }
+        }
+    }
+    res.json({ message: 'Updated', activeAccountId });
 });
 
 // ── Sig relay: the refresher userscript POSTs fresh x-statsig-id here. ──
@@ -203,8 +250,16 @@ app.get('/admin/browser/status', adminAuth, (req, res) => {
 
 app.post('/admin/browser/restart', adminAuth, async (req, res) => {
     if (!ENABLE_BROWSER) return res.status(400).json({ error: 'Browser disabled (ENABLE_BROWSER=0)' });
-    try { await startBrowserForActive(); res.json({ message: 'Browser (re)starting', ...browser.status() }); }
-    catch (e) { res.status(500).json({ error: e.message }); }
+    if (!activeAccountId || !grok.hasAccount)
+        return res.status(400).json({ error: 'No active account — add/select an account first.' });
+    try {
+        await startBrowserForActive();
+        const st = browser.status();
+        if (st.lastError) return res.status(503).json({ error: st.lastError, ...st });
+        res.json({ message: 'Browser launching', ...st });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.post('/admin/browser/stop', adminAuth, async (req, res) => {
@@ -369,7 +424,8 @@ async function boot() {
         console.log('  ╚══════════════════════════════════════╝');
         console.log('');
         try { loadActiveAccount(); } catch (e) { console.error('[Boot] account load:', e.message); }
-        if (activeAccountId && ENABLE_BROWSER) startBrowserForActive().catch(() => {});
+        // Browser is button-only — never auto-launched at boot. Start it from
+        // the admin panel after the active account is loaded.
     });
 }
 
