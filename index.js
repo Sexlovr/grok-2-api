@@ -12,6 +12,7 @@ import {
 } from './lib/translator.js';
 import { buildAdminPage } from './lib/page.js';
 import { buildRefresherUserscript } from './lib/refresher.js';
+import { getBrowserManager } from './lib/browser.js';
 
 config();
 
@@ -22,13 +23,19 @@ app.use(express.json({ limit: '25mb' }));
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
-// ── Admin password: never silently default to "admin" on a public Space. ──
+// ── Admin password. If unset, generate a random one (logged at boot). If it's
+// explicitly set to "admin" we honor it but warn loudly — convenient for a
+// throwaway Space, but anyone who logs in gets your grok session cookie. ──
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-if (!ADMIN_PASSWORD || ADMIN_PASSWORD === 'admin') {
+if (!ADMIN_PASSWORD) {
     ADMIN_PASSWORD = crypto.randomBytes(9).toString('base64url');
-    console.warn('[Auth] ADMIN_PASSWORD was unset or "admin"; generated a random one for this run:');
+    console.warn('[Auth] ADMIN_PASSWORD was unset; generated a random one for this run:');
     console.warn('       ADMIN_PASSWORD = ' + ADMIN_PASSWORD);
     console.warn('       Set it as a Space secret to keep it stable across restarts.');
+} else if (ADMIN_PASSWORD === 'admin') {
+    console.warn('[Auth] ADMIN_PASSWORD is "admin" — INSECURE. Anyone who logs in can read');
+    console.warn('       your grok session cookie. Fine for a throwaway Space; set a strong');
+    console.warn('       value (ideally a Space secret) for anything you care about.');
 }
 
 // ── Refresh token: the shared secret the refresher userscript uses to push sigs. ──
@@ -41,7 +48,32 @@ if (!REFRESH_TOKEN) {
 }
 
 const grok = getGrokClient();
+const browser = getBrowserManager();
 let activeAccountId = null;
+
+// ── In-Space browser: a plain headed Chromium (no CDP) that opens grok.com
+// already logged in (cookies seeded by our extension) and self-feeds fresh sigs
+// to /admin/sig. This is the server-side, phone-independent path. Set
+// ENABLE_BROWSER=0 to run pure-Node only (then feed sigs via the userscript). ──
+const ENABLE_BROWSER = process.env.ENABLE_BROWSER !== '0';
+
+async function startBrowserForActive() {
+    if (!ENABLE_BROWSER) return;
+    const acc = getDB().prepare('SELECT * FROM accounts WHERE id = ?').get(activeAccountId);
+    if (!acc?.cookie) return;
+    const proxyUrl = `http://127.0.0.1:${PORT}`;
+    try {
+        await browser.start({
+            cookieString: acc.cookie,
+            userAgent: acc.user_agent,
+            proxyUrl,
+            refreshToken: REFRESH_TOKEN,
+        });
+        console.log('[Boot] In-Space signer browser launched.');
+    } catch (e) {
+        console.error('[Boot] Browser launch failed (falling back to userscript relay):', e.message);
+    }
+}
 
 // ══════════════════════════════════════════
 //  Helpers
@@ -126,6 +158,7 @@ app.post('/admin/accounts', adminAuth, (req, res) => {
 
     activeAccountId = id;
     grok.loadAccount({ cookie: parsed.cookie, userAgent: parsed.userAgent, statsigId: parsed.statsigId });
+    startBrowserForActive().catch(() => {});
     res.json({
         message: parsed.statsigId
             ? 'Account saved + initial sig seeded (good ~3-4 min). Install the refresher to keep it fed.'
@@ -161,6 +194,41 @@ app.get('/admin/sig-status', adminAuth, (req, res) => {
     res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId });
 });
 
+// ══════════════════════════════════════════
+//  In-Space browser + recovery console
+// ══════════════════════════════════════════
+app.get('/admin/browser/status', adminAuth, (req, res) => {
+    res.json({ enableBrowser: ENABLE_BROWSER, ...browser.status() });
+});
+
+app.post('/admin/browser/restart', adminAuth, async (req, res) => {
+    if (!ENABLE_BROWSER) return res.status(400).json({ error: 'Browser disabled (ENABLE_BROWSER=0)' });
+    try { await startBrowserForActive(); res.json({ message: 'Browser (re)starting', ...browser.status() }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/admin/browser/stop', adminAuth, async (req, res) => {
+    try { await browser.stop(); res.json({ message: 'Browser stopped' }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Screenshot of the virtual display. Auth via ?token= because <img>/MJPEG can't
+// send an Authorization header. Used only for the Cloudflare-challenge recovery
+// console, not the normal serving path.
+app.get('/admin/browser/screen', (req, res) => {
+    try { jwt.verify(req.query.token || '', JWT_SECRET); } catch { return res.status(401).end('unauthorized'); }
+    browser.screenshot()
+        .then(({ buf, mime }) => { res.setHeader('Content-Type', mime); res.setHeader('Cache-Control', 'no-store'); res.end(buf); })
+        .catch(e => res.status(503).end('screenshot failed: ' + e.message));
+});
+
+// Relay a click / text / key into the browser via xdotool.
+app.post('/admin/browser/input', adminAuth, (req, res) => {
+    browser.input(req.body || {})
+        .then(r => res.json(r))
+        .catch(e => res.status(503).json({ error: e.message }));
+});
+
 app.post('/admin/reload', adminAuth, (req, res) => {
     try { loadActiveAccount(); res.json({ message: 'Reloaded', sig: grok.getSigState() }); }
     catch (e) { res.status(500).json({ error: e.message }); }
@@ -172,6 +240,7 @@ app.get('/admin/status', adminAuth, (req, res) => {
         activeAccountId,
         sig: grok.getSigState(),
         refreshTokenHint: REFRESH_TOKEN.slice(0, 4) + '…' + REFRESH_TOKEN.slice(-4),
+        browser: { enableBrowser: ENABLE_BROWSER, ...browser.status() },
     });
 });
 
@@ -300,6 +369,7 @@ async function boot() {
         console.log('  ╚══════════════════════════════════════╝');
         console.log('');
         try { loadActiveAccount(); } catch (e) { console.error('[Boot] account load:', e.message); }
+        if (activeAccountId && ENABLE_BROWSER) startBrowserForActive().catch(() => {});
     });
 }
 
