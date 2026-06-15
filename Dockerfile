@@ -1,9 +1,10 @@
 FROM node:20-bullseye
 
-# OS deps: Xvfb (virtual display for headful Chromium → better anti-bot posture),
+# OS deps: Xvfb + xauth (virtual display for headful Chromium → better anti-bot
+# posture; xvfb-run needs xauth for the X authority cookie),
 # plus the libs Chromium needs. dos2unix guards against CRLF in start.sh.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    xvfb dos2unix ca-certificates fonts-liberation \
+    xvfb xauth dos2unix ca-certificates fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/node/app

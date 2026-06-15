@@ -6,10 +6,11 @@
 # ───────────────────────────────────────────────────────────────
 FROM node:20-bullseye
 
-# OS deps: git (clone), xvfb (headful Chromium → better anti-bot posture),
+# OS deps: git (clone), xvfb + xauth (headful Chromium → better anti-bot
+# posture; xvfb-run needs xauth for the X authority cookie),
 # dos2unix (CRLF guard), fonts/certs for Chromium.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git xvfb dos2unix curl ca-certificates fonts-liberation procps \
+    git xvfb xauth dos2unix curl ca-certificates fonts-liberation procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep Playwright's Chromium inside node_modules so it's accessible after chown.
