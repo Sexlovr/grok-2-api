@@ -17,11 +17,15 @@ RUN dos2unix start.sh && chmod +x start.sh \
     && mkdir -p /data && chown -R node:node /home/node/app /data
 
 USER node
-# DATA_DIR → persistent volume; ADMIN_PASSWORD / REFRESH_TOKEN via secrets
-# (auto-generated + logged if unset).
+# DATA_DIR → persistent volume. ADMIN_PASSWORD = admin-panel login.
+# REFRESH_TOKEN = shared secret the refresher userscript uses to POST sigs.
+# NOTE: public repo → these are world-readable. Move ADMIN_PASSWORD to a Space
+# secret to keep it private; unset values are auto-generated + logged at boot.
 ENV HOME=/home/node \
     PORT=7860 \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    ADMIN_PASSWORD=ZL8sRadxty5tuymP \
+    REFRESH_TOKEN=d76d38a854fc73623a4c5a681576f6f0
 
 EXPOSE 7860
 CMD ["./start.sh"]

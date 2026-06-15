@@ -25,11 +25,21 @@ RUN dos2unix start.sh && chmod +x start.sh \
 
 USER node
 # DATA_DIR points at the HF persistent volume (/data) so accounts/keys survive
-# factory rebuilds. ADMIN_PASSWORD / REFRESH_TOKEN are NOT baked in — set them as
-# Space secrets; if unset the app generates random ones and prints them to logs.
+# factory rebuilds.
+#
+# ADMIN_PASSWORD = login to the admin panel.
+# REFRESH_TOKEN  = shared secret the refresher userscript uses to POST sigs to
+#                  /admin/sig (the userscript embeds it; it's served at
+#                  /grok-refresher.user.js, so it's effectively semi-public).
+# NOTE: this repo/Space is PUBLIC, so these values are world-readable here.
+# To keep ADMIN_PASSWORD private, remove it below and set it as a Space secret
+# instead (Settings → Variables and secrets). If either is unset, the app
+# generates a random one at boot and prints it to the container logs.
 ENV HOME=/home/node \
     PORT=7860 \
-    DATA_DIR=/data
+    DATA_DIR=/data \
+    ADMIN_PASSWORD=ZL8sRadxty5tuymP \
+    REFRESH_TOKEN=d76d38a854fc73623a4c5a681576f6f0
 
 EXPOSE 7860
 CMD ["./start.sh"]
