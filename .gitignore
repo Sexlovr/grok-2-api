@@ -2,5 +2,3 @@ node_modules/
 data/
 .env
 *.log
-# Written at runtime; contains the live grok session cookies — must NOT be public.
-extension/runtime-config.json

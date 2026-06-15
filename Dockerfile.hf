@@ -1,24 +1,13 @@
 # ───────────────────────────────────────────────────────────────
 #  HuggingFace Spaces Dockerfile (clone + deploy).
 #  The Space's active build file must be named `Dockerfile`.
-#  Clones grok-2-api@main fresh; ships the in-Space signer browser stack.
+#  Pure-Node now — no browser, no Xvfb. Clones grok-2-api@main fresh.
 # ───────────────────────────────────────────────────────────────
 FROM node:20-bullseye-slim
 
-# OS deps:
-#  git/dos2unix/ca-certificates → clone, CRLF guard, TLS to grok.com.
-#  chromium                     → the plain HEADED browser that mints valid sigs (no CDP).
-#  xvfb                         → lightweight virtual display (NOT a VNC desktop).
-#  scrot/ffmpeg                 → single-frame screenshots for the recovery console.
-#  xdotool                      → relay clicks/keys into the browser for recovery.
-#  fonts/libs                   → so chromium renders pages + the SVG canary.
+# OS deps: git (clone), dos2unix (CRLF guard), ca-certificates (TLS to grok.com).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git dos2unix ca-certificates \
-    chromium xvfb scrot ffmpeg xdotool \
-    fonts-liberation fonts-noto-color-emoji \
-    libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
-    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
-    libpangocairo-1.0-0 libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Cache-bust: this line changes whenever main advances, forcing HF to re-clone
@@ -35,14 +24,13 @@ RUN dos2unix start.sh && chmod +x start.sh \
     && mkdir -p /data && chown -R node:node /home/node/app /data
 
 USER node
-# DATA_DIR points at the HF persistent volume (/data) so accounts/keys + the
-# chrome profile survive factory rebuilds.
+# DATA_DIR points at the HF persistent volume (/data) so accounts/keys survive
+# factory rebuilds.
 #
 # ADMIN_PASSWORD = login to the admin panel.
-# REFRESH_TOKEN  = shared secret the signer (in-Space extension OR the userscript)
-#                  uses to POST sigs to /admin/sig.
-# CHROMIUM_BIN   = path to the headed browser. ENABLE_BROWSER=0 reverts to
-#                  pure-Node + userscript relay (no in-Space browser).
+# REFRESH_TOKEN  = shared secret the refresher userscript uses to POST sigs to
+#                  /admin/sig (the userscript embeds it; it's served at
+#                  /grok-refresher.user.js, so it's effectively semi-public).
 # NOTE: this repo/Space is PUBLIC, so these values are world-readable here.
 # To keep ADMIN_PASSWORD private, remove it below and set it as a Space secret
 # instead (Settings → Variables and secrets). If either is unset, the app
@@ -50,11 +38,8 @@ USER node
 ENV HOME=/home/node \
     PORT=7860 \
     DATA_DIR=/data \
-    CHROMIUM_BIN=/usr/bin/chromium \
-    ENABLE_BROWSER=1 \
     ADMIN_PASSWORD=admin \
     REFRESH_TOKEN=d76d38a854fc73623a4c5a681576f6f0
 
 EXPOSE 7860
 CMD ["./start.sh"]
-
