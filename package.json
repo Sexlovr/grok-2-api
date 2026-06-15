@@ -1,8 +1,8 @@
 {
   "name": "grok2api",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "description": "Grok (grok.com) reverse proxy with browser-based x-statsig-id signing, OpenAI-compatible API, and admin dashboard",
+  "description": "Grok (grok.com) reverse proxy: pure-Node forwarder fed by a relayed x-statsig-id, OpenAI-compatible API, and admin dashboard",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -13,7 +13,6 @@
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
-    "playwright": "^1.49.0",
     "sql.js": "^1.12.0"
   }
 }

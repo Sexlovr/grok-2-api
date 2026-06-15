@@ -5,12 +5,13 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getDB, initDB } from './lib/database.js';
 import { parseGrokCurl } from './lib/curlParser.js';
-import { getGrokBrowser } from './lib/grokClient.js';
+import { getGrokClient } from './lib/grokClient.js';
 import {
     messagesToPrompt, generateId, hashApiKey,
     buildOpenAIChunk, buildOpenAIResponse,
 } from './lib/translator.js';
 import { buildAdminPage } from './lib/page.js';
+import { buildRefresherUserscript } from './lib/refresher.js';
 
 config();
 
@@ -19,10 +20,27 @@ app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 
 const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
-const grok = getGrokBrowser();
+// ── Admin password: never silently default to "admin" on a public Space. ──
+let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+if (!ADMIN_PASSWORD || ADMIN_PASSWORD === 'admin') {
+    ADMIN_PASSWORD = crypto.randomBytes(9).toString('base64url');
+    console.warn('[Auth] ADMIN_PASSWORD was unset or "admin"; generated a random one for this run:');
+    console.warn('       ADMIN_PASSWORD = ' + ADMIN_PASSWORD);
+    console.warn('       Set it as a Space secret to keep it stable across restarts.');
+}
+
+// ── Refresh token: the shared secret the refresher userscript uses to push sigs. ──
+let REFRESH_TOKEN = process.env.REFRESH_TOKEN;
+if (!REFRESH_TOKEN) {
+    REFRESH_TOKEN = crypto.randomBytes(18).toString('hex');
+    console.warn('[Auth] REFRESH_TOKEN unset; generated one for this run:');
+    console.warn('       REFRESH_TOKEN = ' + REFRESH_TOKEN);
+    console.warn('       Set it as a Space secret so the userscript keeps working across restarts.');
+}
+
+const grok = getGrokClient();
 let activeAccountId = null;
 
 // ══════════════════════════════════════════
@@ -31,21 +49,24 @@ let activeAccountId = null;
 function resolveMode(modelStr) {
     const row = getDB().prepare('SELECT mode_id FROM models WHERE model_id = ? AND active = 1').get(modelStr || '');
     if (row?.mode_id) return row.mode_id;
-    // Heuristic fallback from the model string.
+    // Heuristic fallback from the model string → current grok.com modeIds.
     const m = (modelStr || '').toLowerCase();
-    if (m.includes('reason') || m.includes('think')) return 'MODEL_MODE_REASONING';
-    if (m.includes('fast') || m.includes('flash') || m.includes('instant')) return 'fast';
-    if (m.includes('grok-4')) return 'MODEL_MODE_GROK_4';
-    if (m.includes('expert') || m.includes('grok-3')) return 'MODEL_MODE_EXPERT';
-    return 'fast';
+    if (m.includes('think') || m.includes('reason')) return 'MODEL_MODE_GROK_4_1_THINKING';
+    if (m.includes('heavy')) return 'MODEL_MODE_HEAVY';
+    if (m.includes('fast') || m.includes('flash') || m.includes('instant')) return 'MODEL_MODE_FAST';
+    if (m.includes('expert')) return 'MODEL_MODE_EXPERT';
+    if (m.includes('4.3') || m.includes('43')) return 'MODEL_MODE_GROK43';
+    if (m.includes('4.1') || m.includes('41')) return 'MODEL_MODE_GROK_4_1';
+    return 'MODEL_MODE_AUTO';
 }
 
-async function loadActiveAccountIntoBrowser() {
+function loadActiveAccount() {
     const acc = getDB().prepare('SELECT * FROM accounts WHERE active = 1 ORDER BY last_used DESC, id DESC').get();
     if (!acc) { console.log('[Boot] No active Grok account yet — add one in the admin panel.'); return; }
     activeAccountId = acc.id;
-    await grok.loadAccount({ cookie: acc.cookie, userAgent: acc.user_agent });
+    grok.loadAccount({ cookie: acc.cookie, userAgent: acc.user_agent });
     getDB().prepare("UPDATE accounts SET last_used = datetime('now') WHERE id = ?").run(acc.id);
+    console.log('[Boot] Active account loaded:', acc.label || acc.user_id || acc.id);
 }
 
 // ══════════════════════════════════════════
@@ -84,7 +105,7 @@ app.get('/admin/accounts', adminAuth, (req, res) => {
     res.json(getDB().prepare('SELECT id, label, user_id, active, request_count, last_used, created_at FROM accounts').all());
 });
 
-app.post('/admin/accounts', adminAuth, async (req, res) => {
+app.post('/admin/accounts', adminAuth, (req, res) => {
     const { curl, label } = req.body;
     if (!curl) return res.status(400).json({ error: 'cURL string required' });
     const parsed = parseGrokCurl(curl);
@@ -103,14 +124,14 @@ app.post('/admin/accounts', adminAuth, async (req, res) => {
         id = r.lastInsertRowid;
     }
 
-    // Hot-load the new session into the browser.
-    try {
-        activeAccountId = id;
-        await grok.loadAccount({ cookie: parsed.cookie, userAgent: parsed.userAgent });
-        res.json({ message: 'Account saved and session loaded', id, found: parsed.summary, signer: grok.signerInfo });
-    } catch (e) {
-        res.status(200).json({ message: 'Account saved, but session load failed: ' + e.message, id, found: parsed.summary });
-    }
+    activeAccountId = id;
+    grok.loadAccount({ cookie: parsed.cookie, userAgent: parsed.userAgent, statsigId: parsed.statsigId });
+    res.json({
+        message: parsed.statsigId
+            ? 'Account saved + initial sig seeded (good ~3-4 min). Install the refresher to keep it fed.'
+            : 'Account saved. Now run the refresher userscript on a grok.com tab to feed it a sig.',
+        id, found: parsed.summary, sig: grok.getSigState(),
+    });
 });
 
 app.delete('/admin/accounts/:id', adminAuth, (req, res) => {
@@ -124,19 +145,33 @@ app.patch('/admin/accounts/:id', adminAuth, (req, res) => {
     res.json({ message: 'Updated' });
 });
 
-// Reload the active account / re-discover the signer (e.g. after a Grok deploy).
-app.post('/admin/reload', adminAuth, async (req, res) => {
-    try { await loadActiveAccountIntoBrowser(); res.json({ message: 'Reloaded', signer: grok.signerInfo }); }
+// ── Sig relay: the refresher userscript POSTs fresh x-statsig-id here. ──
+// Auth is the shared REFRESH_TOKEN (header), NOT the admin JWT — so the
+// userscript never carries the admin password.
+app.post('/admin/sig', (req, res) => {
+    const tok = req.headers['x-refresh-token'] || req.body?.token;
+    if (tok !== REFRESH_TOKEN) return res.status(401).json({ error: 'bad refresh token' });
+    const ok = grok.setSig(req.body?.sig);
+    if (!ok) return res.status(400).json({ error: 'invalid sig' });
+    res.json({ ok: true, sig: grok.getSigState() });
+});
+
+// Admin-facing freshness readout for the dashboard widget.
+app.get('/admin/sig-status', adminAuth, (req, res) => {
+    res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId });
+});
+
+app.post('/admin/reload', adminAuth, (req, res) => {
+    try { loadActiveAccount(); res.json({ message: 'Reloaded', sig: grok.getSigState() }); }
     catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/admin/status', adminAuth, (req, res) => {
     res.json({
-        browserUp: !!grok.browser,
-        sessionLoaded: !!grok.page,
+        hasAccount: grok.hasAccount,
         activeAccountId,
-        signer: grok.signerInfo,
-        headless: grok.headless,
+        sig: grok.getSigState(),
+        refreshTokenHint: REFRESH_TOKEN.slice(0, 4) + '…' + REFRESH_TOKEN.slice(-4),
     });
 });
 
@@ -155,6 +190,14 @@ app.patch('/admin/keys/:id', adminAuth, (req, res) => {
 
 app.get('/admin/models', adminAuth, (req, res) => res.json(getDB().prepare('SELECT * FROM models').all()));
 
+// ── Serve the refresher userscript, templated with this Space's origin + token. ──
+app.get('/grok-refresher.user.js', (req, res) => {
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
+    const origin = `${proto}://${req.headers.host}`;
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.send(buildRefresherUserscript({ proxyOrigin: origin, refreshToken: REFRESH_TOKEN }));
+});
+
 // ══════════════════════════════════════════
 //  OpenAI-compatible routes
 // ══════════════════════════════════════════
@@ -166,7 +209,7 @@ app.get('/v1/models', apiKeyAuth, (req, res) => {
 app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
     try {
         const messages = req.body.messages;
-        const model = req.body.model || 'grok-3';
+        const model = req.body.model || 'grok-auto';
         const stream = req.body.stream;
         const includeReasoning = req.body.include_reasoning === true || /think|reason/i.test(model);
 
@@ -175,16 +218,26 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
         if (!messages.some(m => m.role === 'user'))
             return res.status(400).json({ error: { message: 'At least one user message required', type: 'invalid_request' } });
 
-        if (!grok.page) {
-            try { await loadActiveAccountIntoBrowser(); } catch {}
-            if (!grok.page) return res.status(503).json({ error: { message: 'No Grok session loaded. Add an account in the admin panel.', type: 'server_error' } });
+        if (!grok.hasAccount) {
+            try { loadActiveAccount(); } catch {}
+            if (!grok.hasAccount) return res.status(503).json({ error: { message: 'No Grok account loaded. Add one in the admin panel.', type: 'server_error' } });
+        }
+
+        const sigState = grok.getSigState();
+        if (!sigState.hasSig || sigState.stale) {
+            return res.status(503).json({ error: {
+                message: sigState.hasSig
+                    ? `x-statsig-id is stale (${sigState.ageSeconds}s old). Is the refresher userscript running on a grok.com tab?`
+                    : 'No x-statsig-id yet. Install the refresher userscript on a grok.com tab (see admin panel).',
+                type: 'server_error',
+            } });
         }
 
         const prompt = messagesToPrompt(messages);
         const modeId = resolveMode(model);
         const completionId = generateId();
 
-        console.log(`[Chat] msgs=${messages.length} model=${model} mode=${modeId} promptChars=${prompt.length}`);
+        console.log(`[Chat] msgs=${messages.length} model=${model} mode=${modeId} sigAge=${sigState.ageSeconds}s promptChars=${prompt.length}`);
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -237,27 +290,16 @@ app.get('/', (req, res) => { res.setHeader('Content-Type', 'text/html'); res.sen
 async function boot() {
     await initDB();
     console.log('[Boot] Database ready');
-
-    // Bind the port FIRST so the platform health check (HF Spaces expects
-    // something listening on $PORT) passes immediately. Launching Chromium and
-    // navigating to grok.com can hang for a long time behind Cloudflare, so we
-    // must never block app.listen on it — otherwise the Space gets stuck at
-    // "Starting" forever. Account loading runs in the background after listen.
     app.listen(PORT, '0.0.0.0', () => {
         console.log('');
         console.log('  ╔══════════════════════════════════════╗');
-        console.log('  ║         Grok2API Reverse Proxy       ║');
+        console.log('  ║      Grok2API Reverse Proxy (v2)     ║');
         console.log('  ╠══════════════════════════════════════╣');
         console.log('  ║  Admin : http://localhost:' + PORT + '         ║');
         console.log('  ║  API   : http://localhost:' + PORT + '/v1      ║');
         console.log('  ╚══════════════════════════════════════╝');
         console.log('');
-
-        // Fire-and-forget: prime the active account's browser session in the
-        // background. Failures here are logged but never crash the server.
-        loadActiveAccountIntoBrowser()
-            .then(() => console.log('[Boot] Active account loaded into browser'))
-            .catch((e) => console.error('[Boot] account load (background):', e.message));
+        try { loadActiveAccount(); } catch (e) { console.error('[Boot] account load:', e.message); }
     });
 }
 

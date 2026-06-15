@@ -1,29 +1,27 @@
-FROM node:20-bullseye
+FROM node:20-bullseye-slim
 
-# OS deps: Xvfb + xauth (virtual display for headful Chromium → better anti-bot
-# posture; xvfb-run needs xauth for the X authority cookie),
-# plus the libs Chromium needs. dos2unix guards against CRLF in start.sh.
+# Pure-Node now — no browser, no Xvfb. Just git/TLS/CRLF-guard.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    xvfb xauth dos2unix ca-certificates fonts-liberation \
+    dos2unix ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/node/app
 
-# Install node deps first (layer cache), then Playwright's Chromium + its OS deps.
+# Install node deps first (layer cache).
 COPY package.json ./
-RUN npm install
-RUN npx playwright install --with-deps chromium
+RUN npm install --omit=dev
 
 # App source
 COPY . .
-RUN dos2unix start.sh && chmod +x start.sh && chown -R node:node /home/node/app
+RUN dos2unix start.sh && chmod +x start.sh \
+    && mkdir -p /data && chown -R node:node /home/node/app /data
 
 USER node
+# DATA_DIR → persistent volume; ADMIN_PASSWORD / REFRESH_TOKEN via secrets
+# (auto-generated + logged if unset).
 ENV HOME=/home/node \
     PORT=7860 \
-    DATA_DIR=/home/node/app/data \
-    ADMIN_PASSWORD=admin \
-    HEADLESS=0
+    DATA_DIR=/data
 
 EXPOSE 7860
 CMD ["./start.sh"]

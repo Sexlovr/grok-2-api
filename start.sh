@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Start the proxy directly. The Node process binds the port immediately, then
-# launches a virtual X display (Xvfb) lazily from inside the app only when a
-# headful Chromium is actually needed — see lib/grokClient.js. Wrapping the
-# whole process in xvfb-run at the shell level could hang before node ever ran,
-# leaving the platform stuck at "Starting".
+# Start the pure-Node proxy. It binds the port immediately and forwards to
+# grok.com using a relayed x-statsig-id (fed by the refresher userscript) — no
+# browser, no Xvfb. See lib/grokClient.js.
 set -e
 
 exec node index.js
