@@ -1,0 +1,40 @@
+# ───────────────────────────────────────────────────────────────
+#  HuggingFace Spaces Dockerfile (clone + deploy).
+#  On HF, the Space's active build file must be named `Dockerfile`,
+#  so either rename this to `Dockerfile` in the Space, or point the
+#  Space at it. It clones grok-2-api@main fresh on every build.
+# ───────────────────────────────────────────────────────────────
+FROM node:20-bullseye
+
+# OS deps: git (clone), xvfb (headful Chromium → better anti-bot posture),
+# dos2unix (CRLF guard), fonts/certs for Chromium.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git xvfb dos2unix curl ca-certificates fonts-liberation procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep Playwright's Chromium inside node_modules so it's accessible after chown.
+ENV PLAYWRIGHT_BROWSERS_PATH=0
+
+# Cache-bust: this line changes whenever main advances, forcing HF to re-clone
+# instead of serving a stale cached layer.
+ADD "https://api.github.com/repos/Sexlovr/grok-2-api/commits?sha=main&per_page=1" /tmp/latest_commit
+
+RUN git clone --single-branch --branch main \
+    https://github.com/Sexlovr/grok-2-api.git /home/node/app
+WORKDIR /home/node/app
+
+RUN npm install
+# Install Chromium + its OS dependencies (needs root; runs before USER switch).
+RUN npx playwright install --with-deps chromium
+
+RUN dos2unix start.sh && chmod +x start.sh && chown -R node:node /home/node/app
+
+USER node
+ENV HOME=/home/node \
+    PORT=7860 \
+    DATA_DIR=/home/node/app/data \
+    ADMIN_PASSWORD=admin \
+    HEADLESS=0
+
+EXPOSE 7860
+CMD ["./start.sh"]
