@@ -38,7 +38,7 @@ USER node
 ENV HOME=/home/node \
     PORT=7860 \
     DATA_DIR=/data \
-    ADMIN_PASSWORD=ZL8sRadxty5tuymP \
+    ADMIN_PASSWORD=admin \
     REFRESH_TOKEN=d76d38a854fc73623a4c5a681576f6f0
 
 EXPOSE 7860
