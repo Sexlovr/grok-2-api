@@ -15,6 +15,11 @@ import { buildRefresherUserscript } from './lib/refresher.js';
 
 config();
 
+// Last-resort safety net: a stray async error must NEVER crash-loop the Space.
+// Log and keep serving.
+process.on('uncaughtException', (e) => console.error('[uncaughtException]', e?.message || e));
+process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e?.message || e));
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
@@ -22,13 +27,19 @@ app.use(express.json({ limit: '25mb' }));
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
-// ── Admin password: never silently default to "admin" on a public Space. ──
+// ── Admin password. If unset, generate a random one (logged at boot). If it's
+// explicitly set to "admin" we honor it but warn loudly — convenient for a
+// throwaway Space, but anyone who logs in gets your grok session cookie. ──
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-if (!ADMIN_PASSWORD || ADMIN_PASSWORD === 'admin') {
+if (!ADMIN_PASSWORD) {
     ADMIN_PASSWORD = crypto.randomBytes(9).toString('base64url');
-    console.warn('[Auth] ADMIN_PASSWORD was unset or "admin"; generated a random one for this run:');
+    console.warn('[Auth] ADMIN_PASSWORD was unset; generated a random one for this run:');
     console.warn('       ADMIN_PASSWORD = ' + ADMIN_PASSWORD);
     console.warn('       Set it as a Space secret to keep it stable across restarts.');
+} else if (ADMIN_PASSWORD === 'admin') {
+    console.warn('[Auth] ADMIN_PASSWORD is "admin" — INSECURE. Anyone who logs in can read');
+    console.warn('       your grok session cookie. Fine for a throwaway Space; set a strong');
+    console.warn('       value (ideally a Space secret) for anything you care about.');
 }
 
 // ── Refresh token: the shared secret the refresher userscript uses to push sigs. ──
@@ -124,6 +135,11 @@ app.post('/admin/accounts', adminAuth, (req, res) => {
         id = r.lastInsertRowid;
     }
 
+    // Single-active invariant: the newly added/updated account becomes THE active
+    // one; every other account is deactivated. Without this, multiple rows stay
+    // active=1 and loadActiveAccount() can pick a stale one on the next restart.
+    db.prepare('UPDATE accounts SET active = 0 WHERE id != ?').run(id);
+
     activeAccountId = id;
     grok.loadAccount({ cookie: parsed.cookie, userAgent: parsed.userAgent, statsigId: parsed.statsigId });
     res.json({
@@ -135,14 +151,45 @@ app.post('/admin/accounts', adminAuth, (req, res) => {
 });
 
 app.delete('/admin/accounts/:id', adminAuth, (req, res) => {
-    getDB().prepare('DELETE FROM accounts WHERE id = ?').run(req.params.id);
-    res.json({ message: 'Deleted' });
+    const delId = parseInt(req.params.id, 10);
+    getDB().prepare('DELETE FROM accounts WHERE id = ?').run(delId);
+
+    // If we just deleted the account that's loaded in memory, drop it and stop
+    // serving its cookie — otherwise the proxy keeps using a deleted account.
+    if (activeAccountId === delId) {
+        activeAccountId = null;
+        grok.loadAccount(null);
+        // Promote any surviving account (most recent) and make it active.
+        const next = getDB().prepare('SELECT * FROM accounts ORDER BY last_used DESC, id DESC').get();
+        if (next) {
+            getDB().prepare('UPDATE accounts SET active = 1 WHERE id = ?').run(next.id);
+            activeAccountId = next.id;
+            grok.loadAccount({ cookie: next.cookie, userAgent: next.user_agent });
+        }
+    }
+    res.json({ message: 'Deleted', activeAccountId });
 });
 
 app.patch('/admin/accounts/:id', adminAuth, (req, res) => {
-    if (req.body.active !== undefined)
-        getDB().prepare('UPDATE accounts SET active = ? WHERE id = ?').run(req.body.active ? 1 : 0, req.params.id);
-    res.json({ message: 'Updated' });
+    const tgt = parseInt(req.params.id, 10);
+    if (req.body.active !== undefined) {
+        const db = getDB();
+        if (req.body.active) {
+            // Activating one account deactivates the rest (single-active invariant)
+            // and makes it the live one in memory.
+            db.prepare('UPDATE accounts SET active = 0').run();
+            db.prepare('UPDATE accounts SET active = 1 WHERE id = ?').run(tgt);
+            const acc = db.prepare('SELECT * FROM accounts WHERE id = ?').get(tgt);
+            if (acc) {
+                activeAccountId = acc.id;
+                grok.loadAccount({ cookie: acc.cookie, userAgent: acc.user_agent });
+            }
+        } else {
+            db.prepare('UPDATE accounts SET active = 0 WHERE id = ?').run(tgt);
+            if (activeAccountId === tgt) { activeAccountId = null; grok.loadAccount(null); }
+        }
+    }
+    res.json({ message: 'Updated', activeAccountId });
 });
 
 // ── Sig relay: the refresher userscript POSTs fresh x-statsig-id here. ──
