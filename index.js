@@ -237,8 +237,12 @@ app.get('/', (req, res) => { res.setHeader('Content-Type', 'text/html'); res.sen
 async function boot() {
     await initDB();
     console.log('[Boot] Database ready');
-    try { await loadActiveAccountIntoBrowser(); } catch (e) { console.error('[Boot] account load:', e.message); }
 
+    // Bind the port FIRST so the platform health check (HF Spaces expects
+    // something listening on $PORT) passes immediately. Launching Chromium and
+    // navigating to grok.com can hang for a long time behind Cloudflare, so we
+    // must never block app.listen on it — otherwise the Space gets stuck at
+    // "Starting" forever. Account loading runs in the background after listen.
     app.listen(PORT, '0.0.0.0', () => {
         console.log('');
         console.log('  ╔══════════════════════════════════════╗');
@@ -248,6 +252,12 @@ async function boot() {
         console.log('  ║  API   : http://localhost:' + PORT + '/v1      ║');
         console.log('  ╚══════════════════════════════════════╝');
         console.log('');
+
+        // Fire-and-forget: prime the active account's browser session in the
+        // background. Failures here are logged but never crash the server.
+        loadActiveAccountIntoBrowser()
+            .then(() => console.log('[Boot] Active account loaded into browser'))
+            .catch((e) => console.error('[Boot] account load (background):', e.message));
     });
 }
 
