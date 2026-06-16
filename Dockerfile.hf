@@ -1,7 +1,7 @@
 # ───────────────────────────────────────────────────────────────
 #  HuggingFace Spaces Dockerfile (clone + deploy).
 #  The Space's active build file must be named `Dockerfile`.
-#  Clones grok-2-api@main fresh; ships the in-Space signer browser stack.
+#  Clones grok-2-api@in-space-browser fresh; ships the in-Space signer browser stack.
 # ───────────────────────────────────────────────────────────────
 FROM node:20-bullseye-slim
 
@@ -21,11 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpangocairo-1.0-0 libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Cache-bust: this line changes whenever main advances, forcing HF to re-clone
-# instead of serving a stale cached layer.
-ADD "https://api.github.com/repos/Sexlovr/grok-2-api/commits?sha=main&per_page=1" /tmp/latest_commit
+# Cache-bust: this line changes whenever in-space-browser advances, forcing HF
+# to re-clone instead of serving a stale cached layer.
+ADD "https://api.github.com/repos/Sexlovr/grok-2-api/commits?sha=in-space-browser&per_page=1" /tmp/latest_commit
 
-RUN git clone --single-branch --branch main \
+RUN git clone --single-branch --branch in-space-browser \
     https://github.com/Sexlovr/grok-2-api.git /home/node/app
 WORKDIR /home/node/app
 
