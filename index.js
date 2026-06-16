@@ -65,18 +65,27 @@ const ENABLE_BROWSER = process.env.ENABLE_BROWSER !== '0';
 
 async function startBrowserForActive() {
     if (!ENABLE_BROWSER) return;
-    const acc = getDB().prepare('SELECT * FROM accounts WHERE id = ?').get(activeAccountId);
-    if (!acc?.cookie) return;
+    // Two modes:
+    //  • account loaded  → seed its cookies so the tab opens already logged in.
+    //  • no account yet  → LOGIN MODE: launch blank, open grok.com's login page.
+    //    You log in once inside the browser (recovery console), and the extension
+    //    reads the resulting session cookies back out → POST /admin/capture →
+    //    the account is created automatically. No curl, no phone.
+    const acc = activeAccountId
+        ? getDB().prepare('SELECT * FROM accounts WHERE id = ?').get(activeAccountId)
+        : null;
     const proxyUrl = `http://127.0.0.1:${PORT}`;
     try {
         const st = await browser.start({
-            cookieString: acc.cookie,
-            userAgent: acc.user_agent,
+            cookieString: acc?.cookie || '',   // empty = login mode
+            userAgent: acc?.user_agent || '',
             proxyUrl,
             refreshToken: REFRESH_TOKEN,
         });
         if (st.lastError) console.error('[Browser] launch failed:', st.lastError);
-        else console.log('[Browser] In-Space signer browser launched.');
+        else console.log(acc?.cookie
+            ? '[Browser] In-Space signer browser launched (account seeded).'
+            : '[Browser] In-Space browser launched in LOGIN MODE — log in inside it to capture an account.');
         return st;
     } catch (e) {
         console.error('[Browser] launch threw (falling back to userscript relay):', e.message);
@@ -236,6 +245,48 @@ app.post('/admin/sig', (req, res) => {
     res.json({ ok: true, sig: grok.getSigState() });
 });
 
+// ── Auto-capture: the in-Space browser extension POSTs the session cookies it
+// read AFTER you logged in inside the browser (login mode). We build the cookie
+// string, create/update the account, and make it active — no curl needed.
+// Auth is the shared REFRESH_TOKEN (the extension knows it), same as /admin/sig.
+app.post('/admin/capture', (req, res) => {
+    const tok = req.headers['x-refresh-token'] || req.body?.token;
+    if (tok !== REFRESH_TOKEN) return res.status(401).json({ error: 'bad refresh token' });
+
+    const { cookies, userAgent, userId } = req.body || {};
+    if (!Array.isArray(cookies) || !cookies.length)
+        return res.status(400).json({ error: 'no cookies' });
+
+    // Rebuild a "name=value; name=value" cookie string from the captured jar.
+    const cookieStr = cookies
+        .filter(c => c && c.name && c.value)
+        .map(c => `${c.name}=${c.value}`)
+        .join('; ');
+    const hasSso = /(?:^|;\s*)sso(?:-rw)?=/.test(cookieStr);
+    if (!hasSso)
+        return res.status(400).json({ error: 'no sso cookie yet — finish logging in inside the browser' });
+
+    const db = getDB();
+    const uid = userId || '';
+    let id;
+    const existing = uid ? db.prepare('SELECT id FROM accounts WHERE user_id = ?').get(uid) : null;
+    if (existing) {
+        db.prepare('UPDATE accounts SET cookie = ?, user_agent = ?, active = 1 WHERE id = ?')
+            .run(cookieStr, userAgent || '', existing.id);
+        id = existing.id;
+    } else {
+        const r = db.prepare('INSERT INTO accounts (label, cookie, user_agent, user_id) VALUES (?, ?, ?, ?)')
+            .run('captured', cookieStr, userAgent || '', uid);
+        id = r.lastInsertRowid;
+    }
+    // Single-active invariant (same as the curl path).
+    db.prepare('UPDATE accounts SET active = 0 WHERE id != ?').run(id);
+    activeAccountId = id;
+    grok.loadAccount({ cookie: cookieStr, userAgent: userAgent || '' });
+    console.log('[Capture] account', id, existing ? 'updated' : 'created', 'from in-Space login; cookies:', cookies.length);
+    res.json({ ok: true, id, captured: cookies.length, active: true });
+});
+
 // Admin-facing freshness readout for the dashboard widget.
 app.get('/admin/sig-status', adminAuth, (req, res) => {
     res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId });
@@ -250,13 +301,17 @@ app.get('/admin/browser/status', adminAuth, (req, res) => {
 
 app.post('/admin/browser/restart', adminAuth, async (req, res) => {
     if (!ENABLE_BROWSER) return res.status(400).json({ error: 'Browser disabled (ENABLE_BROWSER=0)' });
-    if (!activeAccountId || !grok.hasAccount)
-        return res.status(400).json({ error: 'No active account — add/select an account first.' });
+    // No account gate: launching with no account enters LOGIN MODE so you can
+    // sign in inside the browser and have the account captured automatically.
     try {
         await startBrowserForActive();
         const st = browser.status();
         if (st.lastError) return res.status(503).json({ error: st.lastError, ...st });
-        res.json({ message: 'Browser launching', ...st });
+        res.json({
+            message: activeAccountId ? 'Browser launching' : 'Browser launching in LOGIN MODE — log in inside it to capture an account',
+            loginMode: !activeAccountId,
+            ...st,
+        });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

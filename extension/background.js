@@ -48,7 +48,8 @@ async function seedCookiesAndOpen() {
       console.warn('[Grok2API bg] cookie set failed for', c.name, e.message);
     }
   }
-  console.log('[Grok2API bg] seeded', jar.length, 'cookies');
+  if (jar.length) console.log('[Grok2API bg] seeded', jar.length, 'cookies');
+  else { console.log('[Grok2API bg] LOGIN MODE — no cookies to seed; log in inside the browser'); startCaptureLoop(); }
 
   // Reuse an existing grok tab if one is already open, else create it.
   const startUrl = CFG.startUrl || 'https://grok.com/';
@@ -59,6 +60,45 @@ async function seedCookiesAndOpen() {
   } catch (e) {
     console.warn('[Grok2API bg] open tab failed:', e.message);
   }
+}
+
+// ── LOGIN-MODE capture: poll the cookie jar until a real `sso` session appears
+// (set httpOnly by grok's login — chrome.cookies.getAll CAN read it even though
+// chrome.cookies.set can't write httpOnly). Once seen, POST the whole jar to
+// /admin/capture so the proxy creates the account. Stops after success. ──
+let captureTimer = null;
+let captured = false;
+async function captureOnce() {
+  if (captured) return;
+  try {
+    const jar = await chrome.cookies.getAll({ domain: 'grok.com' });
+    const hasSso = jar.some(c => c.name === 'sso' || c.name === 'sso-rw');
+    if (!hasSso) return;
+    const body = {
+      cookies: jar.map(c => ({ name: c.name, value: c.value })),
+      userAgent: navigator.userAgent,
+      userId: '',
+    };
+    const r = await fetch((CFG.proxyUrl || 'http://127.0.0.1:7860') + '/admin/capture', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-refresh-token': CFG.refreshToken || '' },
+      body: JSON.stringify(body),
+    });
+    if (r.ok) {
+      captured = true;
+      if (captureTimer) { clearInterval(captureTimer); captureTimer = null; }
+      console.log('[Grok2API bg] account captured from login →', r.status);
+    } else {
+      console.warn('[Grok2API bg] capture rejected', r.status);
+    }
+  } catch (e) {
+    console.warn('[Grok2API bg] capture poll failed:', e.message);
+  }
+}
+function startCaptureLoop() {
+  if (captureTimer || captured) return;
+  captureTimer = setInterval(captureOnce, 4000);
+  setTimeout(captureOnce, 2000);
 }
 
 // ── Push a fresh sig to the proxy (debounced). ──
