@@ -25,7 +25,6 @@ app.use(cors());
 app.use(express.json({ limit: '25mb' }));
 
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
 // ── Admin password. If unset, generate a random one (logged at boot). If it's
 // explicitly set to "admin" we honor it but warn loudly — convenient for a
@@ -50,6 +49,14 @@ if (!REFRESH_TOKEN) {
     console.warn('       REFRESH_TOKEN = ' + REFRESH_TOKEN);
     console.warn('       Set it as a Space secret so the userscript keeps working across restarts.');
 }
+
+// ── JWT secret for admin login tokens. If not explicitly set, DERIVE it from the
+// stable admin password + refresh token instead of a random per-boot value —
+// otherwise every Space restart/rebuild rotates the secret and invalidates all
+// existing login tokens, so the dashboard 401s until you log in again. Deriving
+// keeps you logged in across restarts as long as those secrets are stable. ──
+const JWT_SECRET = process.env.JWT_SECRET
+    || crypto.createHash('sha256').update('grok2api|' + ADMIN_PASSWORD + '|' + REFRESH_TOKEN).digest('hex');
 
 const grok = getGrokClient();
 let activeAccountId = null;
