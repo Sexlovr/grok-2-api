@@ -380,7 +380,7 @@ app.get('/admin/models', adminAuth, (req, res) => res.json(getDB().prepare('SELE
 app.get('/grok-refresher.user.js', (req, res) => {
     const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
     const origin = `${proto}://${req.headers.host}`;
-    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.send(buildRefresherUserscript({ proxyOrigin: origin, refreshToken: REFRESH_TOKEN }));
 });
 
