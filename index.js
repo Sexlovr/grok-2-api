@@ -5,13 +5,14 @@ import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getDB, initDB } from './lib/database.js';
 import { parseGrokCurl } from './lib/curlParser.js';
-import { getGrokClient } from './lib/grokClient.js';
+import { getGrokClient, makeStreamState, feedGrokLine } from './lib/grokClient.js';
 import {
     messagesToPrompt, generateId, hashApiKey,
     buildOpenAIChunk, buildOpenAIResponse,
 } from './lib/translator.js';
 import { buildAdminPage } from './lib/page.js';
 import { buildRefresherUserscript } from './lib/refresher.js';
+import { getRelayHub } from './lib/relay.js';
 
 config();
 
@@ -59,7 +60,15 @@ const JWT_SECRET = process.env.JWT_SECRET
     || crypto.createHash('sha256').update('grok2api|' + ADMIN_PASSWORD + '|' + REFRESH_TOKEN).digest('hex');
 
 const grok = getGrokClient();
+const relay = getRelayHub();
 let activeAccountId = null;
+
+// Relay mode: when ON (default), the phone's grok tab is the egress — the Space
+// hands prompts to the userscript worker and never calls grok.com itself. This
+// is the only path that survives grok's IP-bound cf_clearance. Set
+// RELAY_MODE=off to fall back to the direct datacenter forwarder (works only
+// while the sig+clearance happen to pass from the Space's IP).
+const RELAY_MODE = (process.env.RELAY_MODE || 'on').toLowerCase() !== 'off';
 
 // ══════════════════════════════════════════
 //  Helpers
@@ -67,15 +76,17 @@ let activeAccountId = null;
 function resolveMode(modelStr) {
     const row = getDB().prepare('SELECT mode_id FROM models WHERE model_id = ? AND active = 1').get(modelStr || '');
     if (row?.mode_id) return row.mode_id;
-    // Heuristic fallback from the model string → current grok.com modeIds.
+    // Heuristic fallback → grok.com's bare lowercase modeIds (confirmed from live
+    // traffic: the payload field is "modeId":"fast", NOT "MODEL_MODE_FAST").
+    // NOTE: only "fast" is verified working. Bare "auto" returned "Model is not
+    // found", so other names here are best-guess until confirmed from devtools.
+    // We default to "fast" (the one known-good value) rather than an unverified
+    // string so a bad model name degrades to something that actually works.
     const m = (modelStr || '').toLowerCase();
-    if (m.includes('think') || m.includes('reason')) return 'MODEL_MODE_GROK_4_1_THINKING';
-    if (m.includes('heavy')) return 'MODEL_MODE_HEAVY';
-    if (m.includes('fast') || m.includes('flash') || m.includes('instant')) return 'MODEL_MODE_FAST';
-    if (m.includes('expert')) return 'MODEL_MODE_EXPERT';
-    if (m.includes('4.3') || m.includes('43')) return 'MODEL_MODE_GROK43';
-    if (m.includes('4.1') || m.includes('41')) return 'MODEL_MODE_GROK_4_1';
-    return 'MODEL_MODE_AUTO';
+    if (m.includes('expert')) return 'expert';
+    if (m.includes('heavy')) return 'heavy';
+    if (m.includes('think') || m.includes('reason')) return 'reasoning';
+    return 'fast';
 }
 
 function loadActiveAccount() {
@@ -210,9 +221,42 @@ app.post('/admin/sig', (req, res) => {
     res.json({ ok: true, sig: grok.getSigState() });
 });
 
+// ══════════════════════════════════════════
+//  Relay: "phone is the egress" job pickup/return.
+//  The userscript worker on the phone's grok tab uses these. Auth is the shared
+//  REFRESH_TOKEN header (same as /admin/sig) — never the admin JWT.
+// ══════════════════════════════════════════
+function workerAuth(req, res, next) {
+    const tok = req.headers['x-refresh-token'] || req.body?.token;
+    if (tok !== REFRESH_TOKEN) return res.status(401).json({ error: 'bad refresh token' });
+    next();
+}
+
+// Worker long-polls for the next job. Returns {job} or {job:null} after a hold.
+app.post('/relay/poll', workerAuth, async (req, res) => {
+    try {
+        const job = await relay.poll();
+        res.json({ job: job || null });
+    } catch (e) { res.json({ job: null }); }
+});
+
+// Worker streams raw grok NDJSON lines back for a running job.
+app.post('/relay/chunk', workerAuth, (req, res) => {
+    const { id, lines, httpStatus } = req.body || {};
+    const ok = relay.pushChunk(id, lines, httpStatus);
+    res.json({ ok });
+});
+
+// Worker signals the job is finished (or failed).
+app.post('/relay/finish', workerAuth, (req, res) => {
+    const { id, error } = req.body || {};
+    const ok = relay.finish(id, { error });
+    res.json({ ok });
+});
+
 // Admin-facing freshness readout for the dashboard widget.
 app.get('/admin/sig-status', adminAuth, (req, res) => {
-    res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId });
+    res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId, worker: relay.workerState() });
 });
 
 app.post('/admin/reload', adminAuth, (req, res) => {
@@ -225,6 +269,7 @@ app.get('/admin/status', adminAuth, (req, res) => {
         hasAccount: grok.hasAccount,
         activeAccountId,
         sig: grok.getSigState(),
+        worker: relay.workerState(),
         refreshTokenHint: REFRESH_TOKEN.slice(0, 4) + '…' + REFRESH_TOKEN.slice(-4),
     });
 });
@@ -263,6 +308,35 @@ app.get('/v1/models', apiKeyAuth, (req, res) => {
     res.json({ object: 'list', data: rows.map(r => ({ id: r.model_id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'xai' })) });
 });
 
+// Relay-egress chat: hand the prompt to the phone worker, drain the NDJSON it
+// streams back, and parse it through the SAME feedGrokLine as the direct path so
+// the OpenAI translation is identical. Returns { content, conversationId,
+// responseId }; throws on upstream error (same contract as grok.chat()).
+async function runRelayChat({ prompt, modeId, onToken, onThink }) {
+    const job = relay.submit({ prompt, modeId });
+    const st = makeStreamState({ onToken, onThink });
+    try {
+        let cursor = 0;
+        while (true) {
+            const { lines, done } = await relay.waitForLines(job, cursor);
+            cursor += lines.length;
+            for (const ln of lines) if (ln && ln.trim()) feedGrokLine(st, ln);
+            if (st.error) throw new Error('Grok: ' + st.error);
+            if (done) break;
+        }
+        // Worker-reported failure (network / non-2xx from grok on the phone).
+        if (job.status === 'error') {
+            const hint = job.httpStatus === 403
+                ? ' (grok 403 from the phone — sig/clearance issue on the phone tab itself)'
+                : (job.httpStatus ? ` (grok HTTP ${job.httpStatus})` : '');
+            throw new Error((job.error || 'relay error') + hint);
+        }
+        return { content: st.content, conversationId: st.conversationId, responseId: st.lastResponseId };
+    } finally {
+        relay.drop(job.id);
+    }
+}
+
 app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
     try {
         const messages = req.body.messages;
@@ -275,26 +349,43 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
         if (!messages.some(m => m.role === 'user'))
             return res.status(400).json({ error: { message: 'At least one user message required', type: 'invalid_request' } });
 
-        if (!grok.hasAccount) {
-            try { loadActiveAccount(); } catch {}
-            if (!grok.hasAccount) return res.status(503).json({ error: { message: 'No Grok account loaded. Add one in the admin panel.', type: 'server_error' } });
-        }
-
-        const sigState = grok.getSigState();
-        if (!sigState.hasSig || sigState.stale) {
-            return res.status(503).json({ error: {
-                message: sigState.hasSig
-                    ? `x-statsig-id is stale (${sigState.ageSeconds}s old). Is the refresher userscript running on a grok.com tab?`
-                    : 'No x-statsig-id yet. Install the refresher userscript on a grok.com tab (see admin panel).',
-                type: 'server_error',
-            } });
-        }
-
         const prompt = messagesToPrompt(messages);
         const modeId = resolveMode(model);
         const completionId = generateId();
 
-        console.log(`[Chat] msgs=${messages.length} model=${model} mode=${modeId} sigAge=${sigState.ageSeconds}s promptChars=${prompt.length}`);
+        // ── Egress selection ────────────────────────────────────────────────
+        // Prefer the phone relay when a worker is online: the grok call leaves
+        // FROM the phone (residential IP + live cf_clearance + native sig), which
+        // is the only path that survives grok's IP-bound Cloudflare clearance.
+        // Fall back to the direct datacenter path only if no worker is connected
+        // (works just long enough for a sig's TTL, then 403s on most IPs).
+        const useRelay = RELAY_MODE && relay.workerOnline;
+
+        if (!useRelay) {
+            // Direct path: needs a loaded account + a fresh relayed sig.
+            if (!grok.hasAccount) {
+                try { loadActiveAccount(); } catch {}
+                if (!grok.hasAccount) return res.status(503).json({ error: { message: 'No Grok account loaded, and no phone relay worker online. Add an account or open a grok.com tab with the userscript.', type: 'server_error' } });
+            }
+            const sigState = grok.getSigState();
+            if (!sigState.hasSig || sigState.stale) {
+                return res.status(503).json({ error: {
+                    message: sigState.hasSig
+                        ? `x-statsig-id is stale (${sigState.ageSeconds}s old) and no phone relay worker is online. Open a grok.com tab with the userscript.`
+                        : 'No x-statsig-id, and no phone relay worker online. Open a grok.com tab with the userscript (see admin panel).',
+                    type: 'server_error',
+                } });
+            }
+        }
+
+        console.log(`[Chat] via=${useRelay ? 'relay(phone)' : 'direct'} msgs=${messages.length} model=${model} mode=${modeId} promptChars=${prompt.length}`);
+
+        // Picks the right egress and pumps tokens through onThink/onToken.
+        // Throws on upstream error (same contract as grok.chat).
+        async function runChat(handlers) {
+            if (useRelay) return await runRelayChat({ prompt, modeId, ...handlers });
+            return await grok.chat({ prompt, modeId, ...handlers });
+        }
 
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
@@ -305,8 +396,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
 
             let thinkOpen = false;
             try {
-                await grok.chat({
-                    prompt, modeId,
+                await runChat({
                     onThink: (t) => {
                         if (!includeReasoning) return;
                         if (!thinkOpen) { res.write(buildOpenAIChunk(completionId, model, { content: '<think>\n' }, null, null)); thinkOpen = true; }
@@ -325,7 +415,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             res.end();
         } else {
             try {
-                const out = await grok.chat({ prompt, modeId });
+                const out = await runChat({});
                 res.json(buildOpenAIResponse(completionId, model, out.content));
             } catch (e) {
                 res.status(502).json({ error: { message: e.message, type: 'upstream_error' } });
