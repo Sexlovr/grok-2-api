@@ -248,7 +248,10 @@ app.get('/admin/models', adminAuth, (req, res) => res.json(getDB().prepare('SELE
 app.get('/grok-refresher.user.js', (req, res) => {
     const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
     const origin = `${proto}://${req.headers.host}`;
-    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    // text/plain (NOT application/javascript): Chromium-based browsers force-download
+    // a JS content-type; as text/plain the browser renders inline and Tampermonkey's
+    // *.user.js interceptor catches it and offers to install.
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.send(buildRefresherUserscript({ proxyOrigin: origin, refreshToken: REFRESH_TOKEN }));
 });
 
