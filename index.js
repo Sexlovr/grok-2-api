@@ -238,6 +238,11 @@ app.post('/admin/sig', (req, res) => {
 function workerAuth(req, res, next) {
     const tok = req.headers['x-refresh-token'] || req.body?.token;
     if (tok !== REFRESH_TOKEN) return res.status(401).json({ error: 'bad refresh token' });
+    // ANY authenticated worker request proves the tab is alive — keep it "online"
+    // even during a job's silent UI-drive phase (which posts /relay/log, not /poll).
+    // Otherwise a busy worker looks offline after 60s and the sweep wrongly fails
+    // a queued 2nd job.
+    relay.markWorker();
     next();
 }
 
