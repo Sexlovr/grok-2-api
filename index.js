@@ -368,6 +368,14 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             return res.status(400).json({ error: { message: 'At least one user message required', type: 'invalid_request' } });
 
         const prompt = messagesToPrompt(messages);
+        // Stateless: the whole conversation is re-dumped each turn, so the prompt
+        // grows with history. Guard against a runaway prompt that grok would 413
+        // or that would choke the composer textarea — fail with a clear message.
+        const MAX_PROMPT_CHARS = 240000;
+        if (prompt.length > MAX_PROMPT_CHARS) {
+            console.log(`[Chat] REJECTED — prompt ${prompt.length} chars > ${MAX_PROMPT_CHARS} cap`);
+            return res.status(400).json({ error: { message: `Conversation too long (${prompt.length} chars > ${MAX_PROMPT_CHARS}). Trim earlier messages.`, type: 'invalid_request' } });
+        }
         const modeId = resolveMode(model);
         const completionId = generateId();
 
