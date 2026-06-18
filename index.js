@@ -138,7 +138,11 @@ app.post('/admin/accounts', adminAuth, (req, res) => {
     const { curl, label } = req.body;
     if (!curl) return res.status(400).json({ error: 'cURL string required' });
     const parsed = parseGrokCurl(curl);
-    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    if (parsed.error) {
+        console.log(`[Account] curl parse FAILED — ${parsed.error}`);
+        return res.status(400).json({ error: parsed.error });
+    }
+    console.log(`[Account] curl parsed — sso=${!!parsed.sso} cf_clearance=${!!parsed.cfClearance} x-statsig-id=${parsed.statsigId ? `present(len=${parsed.statsigId.length})` : 'MISSING — paste a curl from a request that carries x-statsig-id (e.g. a /rest/app-chat call), dashboard will say "not captured" until the refresher feeds one'}`);
 
     const db = getDB();
     let id;
@@ -215,8 +219,13 @@ app.patch('/admin/accounts/:id', adminAuth, (req, res) => {
 // userscript never carries the admin password.
 app.post('/admin/sig', (req, res) => {
     const tok = req.headers['x-refresh-token'] || req.body?.token;
-    if (tok !== REFRESH_TOKEN) return res.status(401).json({ error: 'bad refresh token' });
-    const ok = grok.setSig(req.body?.sig);
+    const sig = req.body?.sig;
+    console.log(`[Sig] POST /admin/sig — tokenOk=${tok === REFRESH_TOKEN} sigLen=${sig ? String(sig).length : 0}`);
+    if (tok !== REFRESH_TOKEN) {
+        console.log('[Sig] push REJECTED — bad refresh token (check userscript TOKEN matches REFRESH_TOKEN)');
+        return res.status(401).json({ error: 'bad refresh token' });
+    }
+    const ok = grok.setSig(sig);
     if (!ok) return res.status(400).json({ error: 'invalid sig' });
     res.json({ ok: true, sig: grok.getSigState() });
 });
@@ -369,6 +378,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             }
             const sigState = grok.getSigState();
             if (!sigState.hasSig || sigState.stale) {
+                console.log(`[Chat] BLOCKED 503 (direct path) — hasSig=${sigState.hasSig} stale=${sigState.stale} age=${sigState.ageSeconds}s. No phone worker online; need a fresh sig.`);
                 return res.status(503).json({ error: {
                     message: sigState.hasSig
                         ? `x-statsig-id is stale (${sigState.ageSeconds}s old) and no phone relay worker is online. Open a grok.com tab with the userscript.`
@@ -448,6 +458,17 @@ async function boot() {
         console.log('');
         try { loadActiveAccount(); } catch (e) { console.error('[Boot] account load:', e.message); }
     });
+
+    // Heartbeat: print live state once a minute so the HF log shows, at a glance,
+    // whether the phone worker is connected and whether the sig is fresh — without
+    // having to make a request. Only logs when something is worth noting.
+    let _lastBeat = '';
+    setInterval(() => {
+        const s = grok.getSigState();
+        const w = relay.workerState();
+        const beat = `worker=${w.online ? 'ONLINE' : 'offline'}(${w.lastSeenSeconds == null ? 'never' : w.lastSeenSeconds + 's'}) sig=${s.hasSig ? (s.stale ? `stale(${s.ageSeconds}s)` : `fresh(${s.ageSeconds}s)`) : 'NONE'} account=${grok.hasAccount ? 'loaded' : 'none'}`;
+        if (beat !== _lastBeat) { console.log(`[Heartbeat] ${beat}`); _lastBeat = beat; }
+    }, 60 * 1000).unref?.();
 }
 
 boot().catch(e => { console.error('[FATAL]', e); process.exit(1); });
