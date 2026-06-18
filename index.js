@@ -263,6 +263,15 @@ app.post('/relay/finish', workerAuth, (req, res) => {
     res.json({ ok });
 });
 
+// Worker pipes a debug line straight into the HF server log. Lets us see what
+// the phone is doing (which sign strategy grok accepted, response bodies, etc.)
+// without access to the phone's own console.
+app.post('/relay/log', workerAuth, (req, res) => {
+    const msg = String(req.body?.msg || '').slice(0, 400);
+    if (msg) console.log('[Worker] ' + msg);
+    res.json({ ok: true });
+});
+
 // Admin-facing freshness readout for the dashboard widget.
 app.get('/admin/sig-status', adminAuth, (req, res) => {
     res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId, worker: relay.workerState() });
