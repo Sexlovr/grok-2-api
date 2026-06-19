@@ -12,10 +12,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git dos2unix ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Cache-bust: this line changes whenever the HIVE branch advances, forcing HF to
-# re-clone instead of serving a stale cached layer.
-ADD "https://api.github.com/repos/Sexlovr/grok-2-api/commits?sha=hive&per_page=1" /tmp/latest_commit
-
+# NOTE: do NOT add `ADD https://api.github.com/...` as a cache-bust — that hits
+# GitHub's UNAUTHENTICATED API (60 req/hr, shared across all of HF's build IPs),
+# so it intermittently 403s and FAILS the whole build (the Space ends up paused).
+# To pull the latest code, use HF "Settings → Factory rebuild" (it ignores the
+# build cache and re-clones). A plain restart may serve a cached clone.
 RUN git clone --single-branch --branch hive \
     https://github.com/Sexlovr/grok-2-api.git /home/node/app
 WORKDIR /home/node/app
