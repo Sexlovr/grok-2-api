@@ -76,16 +76,14 @@ const RELAY_MODE = (process.env.RELAY_MODE || 'on').toLowerCase() !== 'off';
 function resolveMode(modelStr) {
     const row = getDB().prepare('SELECT mode_id FROM models WHERE model_id = ? AND active = 1').get(modelStr || '');
     if (row?.mode_id) return row.mode_id;
-    // Heuristic fallback → grok.com's bare lowercase modeIds (confirmed from live
-    // traffic: the payload field is "modeId":"fast", NOT "MODEL_MODE_FAST").
-    // NOTE: only "fast" is verified working. Bare "auto" returned "Model is not
-    // found", so other names here are best-guess until confirmed from devtools.
-    // We default to "fast" (the one known-good value) rather than an unverified
-    // string so a bad model name degrades to something that actually works.
+    // Heuristic fallback → grok's "Model select" menu labels, CONFIRMED from a
+    // live screenshot: fast / auto / expert / heavy (no thinking/reasoning mode).
+    // Default to "fast" (always available, even on free tier) so an unknown model
+    // name degrades to something every account can serve.
     const m = (modelStr || '').toLowerCase();
     if (m.includes('expert')) return 'expert';
     if (m.includes('heavy')) return 'heavy';
-    if (m.includes('think') || m.includes('reason')) return 'reasoning';
+    if (m.includes('auto')) return 'auto';
     return 'fast';
 }
 
