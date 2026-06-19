@@ -13,6 +13,7 @@ import {
 import { buildAdminPage } from './lib/page.js';
 import { buildRefresherUserscript } from './lib/refresher.js';
 import { getRelayHub } from './lib/relay.js';
+import { getHive } from './lib/hive.js';
 
 config();
 
@@ -61,7 +62,14 @@ const JWT_SECRET = process.env.JWT_SECRET
 
 const grok = getGrokClient();
 const relay = getRelayHub();
+const hive = getHive();
 let activeAccountId = null;
+
+// Hive mode: multi-user self-service. Each user's userscript auto-registers a
+// persistent grok_<hex> key (their API key AND their worker id) and serves from
+// their OWN grok tab; if their tab is offline, the shared worker pool covers
+// them. ON by default; legacy single-account relay still works underneath.
+const HIVE_MODE = (process.env.HIVE_MODE || 'on').toLowerCase() !== 'off';
 
 // Relay mode: when ON (default), the phone's grok tab is the egress — the Space
 // hands prompts to the userscript worker and never calls grok.com itself. This
@@ -115,6 +123,19 @@ function apiKeyAuth(req, res, next) {
     const h = req.headers.authorization;
     if (!h || !h.startsWith('Bearer ')) return res.status(401).json({ error: { message: 'Missing API key', type: 'auth_error' } });
     const key = h.split(' ')[1];
+
+    // Hive key (grok_…): self-service per-user key. Routes to that user's own
+    // worker, with shared-pool fallback. req.hiveKey marks the request.
+    if (HIVE_MODE && key.startsWith('grok_')) {
+        const hu = lookupHiveKey(key);
+        if (!hu) return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
+        getDB().prepare('UPDATE hive_users SET request_count = request_count + 1, last_seen = CURRENT_TIMESTAMP WHERE id = ?').run(hu.id);
+        req.hiveKey = key;
+        req.apiKeyHash = hashApiKey(key);
+        return next();
+    }
+
+    // Legacy global key (sk-grok-…): single shared account.
     const row = getDB().prepare('SELECT * FROM api_keys WHERE key = ? AND active = 1').get(key);
     if (!row) return res.status(401).json({ error: { message: 'Invalid API key', type: 'auth_error' } });
     getDB().prepare('UPDATE api_keys SET request_count = request_count + 1 WHERE id = ?').run(row.id);
@@ -235,13 +256,21 @@ app.post('/admin/sig', (req, res) => {
 //  The userscript worker on the phone's grok tab uses these. Auth is the shared
 //  REFRESH_TOKEN header (same as /admin/sig) — never the admin JWT.
 // ══════════════════════════════════════════
+// Dual-mode worker auth. A HIVE worker authenticates with its own grok_ key
+// (header x-hive-key or body.hiveKey) → req.hiveKey set, routed to the hive.
+// The LEGACY single-account worker uses the shared REFRESH_TOKEN → routed to the
+// relay hub. ANY authenticated worker request marks the worker alive (so a busy
+// worker mid-UI-drive isn't declared offline).
 function workerAuth(req, res, next) {
+    const hk = req.headers['x-hive-key'] || req.body?.hiveKey;
+    if (HIVE_MODE && hk && hk.startsWith('grok_')) {
+        if (!lookupHiveKey(hk)) return res.status(401).json({ error: 'invalid hive key' });
+        req.hiveKey = hk;
+        hive.markWorker(hk);
+        return next();
+    }
     const tok = req.headers['x-refresh-token'] || req.body?.token;
     if (tok !== REFRESH_TOKEN) return res.status(401).json({ error: 'bad refresh token' });
-    // ANY authenticated worker request proves the tab is alive — keep it "online"
-    // even during a job's silent UI-drive phase (which posts /relay/log, not /poll).
-    // Otherwise a busy worker looks offline after 60s and the sweep wrongly fails
-    // a queued 2nd job.
     relay.markWorker();
     next();
 }
@@ -249,7 +278,7 @@ function workerAuth(req, res, next) {
 // Worker long-polls for the next job. Returns {job} or {job:null} after a hold.
 app.post('/relay/poll', workerAuth, async (req, res) => {
     try {
-        const job = await relay.poll();
+        const job = req.hiveKey ? await hive.poll(req.hiveKey) : await relay.poll();
         res.json({ job: job || null });
     } catch (e) { res.json({ job: null }); }
 });
@@ -257,14 +286,14 @@ app.post('/relay/poll', workerAuth, async (req, res) => {
 // Worker streams raw grok NDJSON lines back for a running job.
 app.post('/relay/chunk', workerAuth, (req, res) => {
     const { id, lines, httpStatus } = req.body || {};
-    const ok = relay.pushChunk(id, lines, httpStatus);
+    const ok = req.hiveKey ? hive.pushChunk(req.hiveKey, id, lines, httpStatus) : relay.pushChunk(id, lines, httpStatus);
     res.json({ ok });
 });
 
 // Worker signals the job is finished (or failed).
 app.post('/relay/finish', workerAuth, (req, res) => {
     const { id, error } = req.body || {};
-    const ok = relay.finish(id, { error });
+    const ok = req.hiveKey ? hive.finish(req.hiveKey, id, { error }) : relay.finish(id, { error });
     res.json({ ok });
 });
 
@@ -273,13 +302,27 @@ app.post('/relay/finish', workerAuth, (req, res) => {
 // without access to the phone's own console.
 app.post('/relay/log', workerAuth, (req, res) => {
     const msg = String(req.body?.msg || '').slice(0, 400);
-    if (msg) console.log('[Worker] ' + msg);
+    if (msg) console.log(`[Worker${req.hiveKey ? ' ' + req.hiveKey.slice(0, 9) + '…' : ''}] ` + msg);
     res.json({ ok: true });
 });
 
 // Admin-facing freshness readout for the dashboard widget.
 app.get('/admin/sig-status', adminAuth, (req, res) => {
-    res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId, worker: relay.workerState() });
+    res.json({ ...grok.getSigState(), hasAccount: grok.hasAccount, activeAccountId, worker: relay.workerState(), hive: { workersOnline: hive.onlineCount() } });
+});
+
+// Hive overview: registered users + how many of their worker tabs are online.
+app.get('/admin/hive', adminAuth, (req, res) => {
+    const users = getDB().prepare('SELECT key, label, request_count, last_seen, created_at FROM hive_users ORDER BY id DESC').all();
+    res.json({
+        workersOnline: hive.onlineCount(),
+        users: users.map(u => ({
+            key: u.key.slice(0, 9) + '…' + u.key.slice(-4),
+            label: u.label, requests: u.request_count,
+            workerOnline: hive.workerOnline(u.key),
+            lastSeen: u.last_seen, createdAt: u.created_at,
+        })),
+    });
 });
 
 app.post('/admin/reload', adminAuth, (req, res) => {
@@ -324,6 +367,63 @@ app.get('/grok-refresher.user.js', (req, res) => {
 });
 
 // ══════════════════════════════════════════
+//  Hive: self-service multi-user keys
+// ══════════════════════════════════════════
+// The userscript calls this once on first load (no auth) to mint a persistent
+// key it then stores forever in GM_setValue. The key is BOTH the user's API key
+// and their worker id. Re-registering is harmless (a returning user reuses its
+// stored key and never calls this again).
+app.post('/register', (req, res) => {
+    if (!HIVE_MODE) return res.status(403).json({ error: 'hive mode is off' });
+    const key = 'grok_' + crypto.randomBytes(20).toString('hex');
+    const label = (req.body?.label || '').toString().slice(0, 40);
+    getDB().prepare('INSERT INTO hive_users (key, label, last_seen) VALUES (?, ?, CURRENT_TIMESTAMP)').run(key, label);
+    console.log(`[Hive] registered new user key=${key.slice(0, 9)}… label=${label || '(none)'}`);
+    res.json({ key, message: 'Save this key — it is your API key. Keep this grok.com tab open to serve your own requests.' });
+});
+
+// Validate a hive key (worker-auth for the key-scoped relay endpoints + API auth).
+function lookupHiveKey(key) {
+    if (!key || !key.startsWith('grok_')) return null;
+    return getDB().prepare('SELECT * FROM hive_users WHERE key = ? AND active = 1').get(key);
+}
+
+// Dead-simple public onboarding page. Three steps, no jargon.
+app.get('/connect', (req, res) => {
+    const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
+    const origin = `${proto}://${req.headers.host}`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html><html><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Connect to Grok2API</title>
+<style>
+ body{margin:0;background:#0c0e12;color:#e8eaed;font:16px/1.6 system-ui,sans-serif}
+ .wrap{max-width:620px;margin:0 auto;padding:28px 20px 60px}
+ h1{font-size:22px;margin:0 0 4px} .sub{color:#9aa0a6;margin:0 0 24px}
+ .step{background:#15181d;border:1px solid #2a2f37;border-radius:12px;padding:16px 18px;margin:14px 0}
+ .n{display:inline-block;width:24px;height:24px;border-radius:50%;background:#2fbf71;color:#06210f;font-weight:800;text-align:center;line-height:24px;margin-right:8px}
+ a.btn{display:inline-block;margin-top:8px;background:#2fbf71;color:#06210f;font-weight:700;text-decoration:none;padding:9px 16px;border-radius:8px}
+ code{background:#0c0e12;padding:2px 6px;border-radius:5px;font-size:13px}
+ .muted{color:#9aa0a6;font-size:14px}
+</style></head><body><div class=wrap>
+<h1>Grok2API — connect your grok</h1>
+<p class=sub>Use your own grok.com account as an OpenAI-compatible API. No cookies, no setup.</p>
+<div class=step><span class=n>1</span><b>Install a userscript manager</b><br>
+<span class=muted>Tampermonkey (Chrome/Edge/Kiwi/Quetta) or Violentmonkey (Firefox). One-time.</span></div>
+<div class=step><span class=n>2</span><b>Install the worker script</b><br>
+<a class=btn href="${origin}/grok-refresher.user.js">Install Grok2API worker</a>
+<div class=muted style="margin-top:8px">Your manager will pop up — click Install.</div></div>
+<div class=step><span class=n>3</span><b>Open grok.com (logged in) and copy your key</b><br>
+<a class=btn href="https://grok.com/" target=_blank rel=noopener>Open grok.com</a>
+<div class=muted style="margin-top:8px">A green box shows <b>Your Grok2API key</b> — tap <b>Copy key</b>.
+Keep this tab open; it serves your own requests.</div></div>
+<div class=step><span class=n>✓</span><b>Use it</b><br>
+<span class=muted>Base URL <code>${origin}/v1</code> · API key = the <code>grok_…</code> from step 3 · model <code>grok-fast</code>.
+If your tab is closed, the shared pool covers you when someone else is online.</span></div>
+</div></body></html>`);
+});
+
+// ══════════════════════════════════════════
 //  OpenAI-compatible routes
 // ══════════════════════════════════════════
 app.get('/v1/models', apiKeyAuth, (req, res) => {
@@ -331,32 +431,35 @@ app.get('/v1/models', apiKeyAuth, (req, res) => {
     res.json({ object: 'list', data: rows.map(r => ({ id: r.model_id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'xai' })) });
 });
 
-// Relay-egress chat: hand the prompt to the phone worker, drain the NDJSON it
-// streams back, and parse it through the SAME feedGrokLine as the direct path so
-// the OpenAI translation is identical. Returns { content, conversationId,
-// responseId }; throws on upstream error (same contract as grok.chat()).
-async function runRelayChat({ prompt, modeId, onToken, onThink }) {
-    const job = relay.submit({ prompt, modeId });
+// Worker-egress chat: hand the prompt to a worker tab (hive: the user's own /
+// pool; relay: the legacy single account), drain the NDJSON it streams back, and
+// parse it through the SAME feedGrokLine as the direct path so the OpenAI
+// translation is identical. `hub` is the hive or relay hub (same job contract).
+// Returns { content, conversationId, responseId }; throws on upstream error.
+async function runWorkerChat({ hub, ownerKey, prompt, modeId, onToken, onThink }) {
+    const job = hub === hive
+        ? hive.submit({ ownerKey, prompt, modeId })
+        : relay.submit({ prompt, modeId });
     const st = makeStreamState({ onToken, onThink });
     try {
         let cursor = 0;
         while (true) {
-            const { lines, done } = await relay.waitForLines(job, cursor);
+            const { lines, done } = await hub.waitForLines(job, cursor);
             cursor += lines.length;
             for (const ln of lines) if (ln && ln.trim()) feedGrokLine(st, ln);
             if (st.error) throw new Error('Grok: ' + st.error);
             if (done) break;
         }
-        // Worker-reported failure (network / non-2xx from grok on the phone).
+        // Worker-reported failure (network / non-2xx from grok in the tab).
         if (job.status === 'error') {
             const hint = job.httpStatus === 403
-                ? ' (grok 403 from the phone — sig/clearance issue on the phone tab itself)'
+                ? ' (grok 403 in the worker tab — sig/clearance issue on that tab itself)'
                 : (job.httpStatus ? ` (grok HTTP ${job.httpStatus})` : '');
             throw new Error((job.error || 'relay error') + hint);
         }
         return { content: st.content, conversationId: st.conversationId, responseId: st.lastResponseId };
     } finally {
-        relay.drop(job.id);
+        hub.drop(job.id);
     }
 }
 
@@ -385,14 +488,24 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
         const completionId = generateId();
 
         // ── Egress selection ────────────────────────────────────────────────
-        // Prefer the phone relay when a worker is online: the grok call leaves
-        // FROM the phone (residential IP + live cf_clearance + native sig), which
-        // is the only path that survives grok's IP-bound Cloudflare clearance.
-        // Fall back to the direct datacenter path only if no worker is connected
-        // (works just long enough for a sig's TTL, then 403s on most IPs).
-        const useRelay = RELAY_MODE && relay.workerOnline;
+        //  1. HIVE: if the request used a grok_ key, route to the hive — the
+        //     user's OWN worker tab if online, else the shared worker pool. The
+        //     grok call leaves from a real residential grok tab (the only path
+        //     that survives grok's IP-bound Cloudflare clearance).
+        //  2. RELAY: legacy single-account phone worker.
+        //  3. DIRECT: datacenter forwarder (needs a fresh relayed sig); last resort.
+        const useHive = HIVE_MODE && !!req.hiveKey &&
+            (hive.workerOnline(req.hiveKey) || hive.anyWorkerOnline());
+        const useRelay = !useHive && RELAY_MODE && relay.workerOnline;
 
-        if (!useRelay) {
+        if (useHive) {
+            // nothing to pre-check: hive.submit picks own-worker→pool, and the
+            // sweep fast-fails with a clear message if truly no worker is online.
+        } else if (req.hiveKey) {
+            // A hive key but no worker anywhere to serve it.
+            console.log(`[Chat] BLOCKED 503 (hive) — key=${req.hiveKey.slice(0, 9)}… no worker online (own or pool)`);
+            return res.status(503).json({ error: { message: 'No grok worker online. Open your grok.com tab with the userscript installed (and keep it foregrounded).', type: 'server_error' } });
+        } else if (!useRelay) {
             // Direct path: needs a loaded account + a fresh relayed sig.
             if (!grok.hasAccount) {
                 try { loadActiveAccount(); } catch {}
@@ -410,12 +523,14 @@ app.post('/v1/chat/completions', apiKeyAuth, async (req, res) => {
             }
         }
 
-        console.log(`[Chat] via=${useRelay ? 'relay(phone)' : 'direct'} msgs=${messages.length} model=${model} mode=${modeId} promptChars=${prompt.length}`);
+        const via = useHive ? `hive(${req.hiveKey.slice(0, 9)}…${hive.workerOnline(req.hiveKey) ? ',own' : ',pool'})` : useRelay ? 'relay(phone)' : 'direct';
+        console.log(`[Chat] via=${via} msgs=${messages.length} model=${model} mode=${modeId} promptChars=${prompt.length}`);
 
         // Picks the right egress and pumps tokens through onThink/onToken.
         // Throws on upstream error (same contract as grok.chat).
         async function runChat(handlers) {
-            if (useRelay) return await runRelayChat({ prompt, modeId, ...handlers });
+            if (useHive) return await runWorkerChat({ hub: hive, ownerKey: req.hiveKey, prompt, modeId, ...handlers });
+            if (useRelay) return await runWorkerChat({ hub: relay, ownerKey: null, prompt, modeId, ...handlers });
             return await grok.chat({ prompt, modeId, ...handlers });
         }
 
